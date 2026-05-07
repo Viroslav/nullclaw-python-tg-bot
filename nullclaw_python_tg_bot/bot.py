@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -29,7 +30,7 @@ _bootstrap_sibling_nullwatch_py()
 from aiogram import Bot, Dispatcher, Router  # noqa: E402
 from aiogram.enums import ChatAction, ParseMode  # noqa: E402
 from aiogram.filters import Command  # noqa: E402
-from aiogram.types import Message  # noqa: E402
+from aiogram.types import BotCommand, Message  # noqa: E402
 from nullwatch import Eval, NullwatchClient  # noqa: E402
 from nullwatch.scorers import (  # noqa: E402
     RAGHallucinationScorer,
@@ -57,6 +58,18 @@ TOOL_GROUNDING_BACKEND = (
 )
 TOOL_GROUNDING_LLM_URL = os.getenv("TOOL_GROUNDING_LLM_URL", f"{OLLAMA_URL}/v1").rstrip("/")
 TOOL_GROUNDING_MODEL = os.getenv("TOOL_GROUNDING_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
+NULLCLAW_HOME_DIR = Path(
+    os.getenv(
+        "NULLCLAW_HOME",
+        str(Path(__file__).resolve().parents[2] / "nullclaw-test-home"),
+    )
+).resolve()
+WORKSPACE_DIR = Path(
+    os.getenv(
+        "NULLCLAW_WORKSPACE_DIR",
+        str(NULLCLAW_HOME_DIR / "workspace"),
+    )
+).resolve()
 
 if LLM_BACKEND not in {"ollama", "nullclaw"}:
     raise SystemExit("LLM_BACKEND must be 'ollama' or 'nullclaw'")
@@ -78,6 +91,17 @@ NULLCLAW_RUNTIME_OPERATIONS = {
     "tool.start",
     "tool.call",
     "turn.complete",
+}
+ALLOWED_WORKSPACE_MARKDOWN_FILES = {
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "CONFIG.md",
+    "IDENTITY.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
 }
 
 CORPUS = [
@@ -265,6 +289,32 @@ def parse_tool_detail(attributes: dict) -> str | None:
     return json.dumps(detail, ensure_ascii=False)
 
 
+def summarize_nullclaw_spans(spans: list[dict]) -> dict:
+    operations: list[str] = []
+    errors: list[str] = []
+
+    for span in spans:
+        operation = str(span.get("operation") or "")
+        status = str(span.get("status") or "")
+        if operation and operation not in operations:
+            operations.append(operation)
+        if status != "error":
+            continue
+
+        error_message = str(span.get("error_message") or "").strip()
+        if error_message:
+            errors.append(f"{operation}: {error_message}" if operation else error_message)
+        elif operation:
+            errors.append(f"{operation}: status=error")
+        else:
+            errors.append("runtime span reported status=error")
+
+    return {
+        "operations": operations,
+        "errors": errors,
+    }
+
+
 def find_recent_nullclaw_run(started_at_ms: int) -> tuple[str | None, str | None, list[dict]]:
     for _ in range(NULLCLAW_SPAN_POLL_ATTEMPTS):
         spans = client.list_spans(limit=NULLCLAW_SPAN_LIMIT)
@@ -301,6 +351,7 @@ def find_recent_nullclaw_run(started_at_ms: int) -> tuple[str | None, str | None
 def extract_nullclaw_tool_calls(started_at_ms: int) -> tuple[list[dict], dict]:
     observed_run_id, observed_source, spans = find_recent_nullclaw_run(started_at_ms)
     tool_calls: list[dict] = []
+    span_summary = summarize_nullclaw_spans(spans)
 
     for span in spans:
         if span.get("operation") != "tool.call":
@@ -333,6 +384,8 @@ def extract_nullclaw_tool_calls(started_at_ms: int) -> tuple[list[dict], dict]:
         "observed_run_id": observed_run_id,
         "observed_source": observed_source,
         "observed_span_count": len(spans),
+        "observed_operations": span_summary["operations"],
+        "observed_errors": span_summary["errors"],
     }
 
 
@@ -374,12 +427,16 @@ def build_nullclaw_tool_eval(
     observed_run_id: str | None = None,
     observed_source: str | None = None,
     observed_span_count: int = 0,
+    observed_operations: list[str] | None = None,
+    observed_errors: list[str] | None = None,
 ) -> Eval:
     base_meta = {
         "backend": "nullclaw",
         "observed_run_id": observed_run_id,
         "observed_source": observed_source,
         "observed_span_count": observed_span_count,
+        "observed_operations": observed_operations or [],
+        "observed_errors": observed_errors or [],
     }
     if not observed_run_id:
         return Eval(
@@ -396,6 +453,18 @@ def build_nullclaw_tool_eval(
         )
 
     if not tool_calls:
+        if observed_errors:
+            return Eval(
+                run_id=run_id,
+                eval_key="tool_call_validity",
+                scorer="nullclaw-observed-tools",
+                score=0.0,
+                verdict="fail",
+                notes="Observed nullclaw runtime errors before any tool.call span: " + "; ".join(observed_errors),
+                meta={**base_meta, "tool_count": 0},
+            )
+
+        rendered_operations = ", ".join(observed_operations or [])
         return Eval(
             run_id=run_id,
             eval_key="tool_call_validity",
@@ -404,7 +473,12 @@ def build_nullclaw_tool_eval(
             verdict="fail",
             notes=(
                 "Observed the nullclaw run in nullwatch, but there were no tool.call spans for this request. "
-                "The model likely answered directly without executing tools."
+                + (
+                    f"Observed operations: {rendered_operations}. "
+                    if rendered_operations
+                    else ""
+                )
+                + "The model likely answered directly without executing tools."
             ),
             meta={**base_meta, "tool_count": 0},
         )
@@ -503,6 +577,103 @@ def parse_command(text: str) -> tuple[str, str]:
     return ("agent" if LLM_BACKEND == "nullclaw" else "rag"), stripped
 
 
+def split_prefixed_command(text: str) -> tuple[str | None, str]:
+    stripped = text.strip()
+    if not stripped:
+        return None, ""
+
+    for command in ("agent", "rag", "tool"):
+        prefix = f"/{command}"
+        if stripped == prefix:
+            return command, ""
+        if stripped.startswith(prefix + " "):
+            return command, stripped[len(prefix) + 1 :].strip()
+
+    return None, stripped
+
+
+def resolve_workspace_markdown(filename: str) -> Path:
+    normalized = filename.strip()
+    if "/" in normalized or "\\" in normalized:
+        raise ValueError("Only workspace root markdown files are allowed.")
+    if normalized not in ALLOWED_WORKSPACE_MARKDOWN_FILES:
+        allowed = ", ".join(sorted(ALLOWED_WORKSPACE_MARKDOWN_FILES))
+        raise ValueError(f"Unsupported markdown file. Allowed: {allowed}")
+    return WORKSPACE_DIR / normalized
+
+
+def read_workspace_markdown(filename: str) -> str:
+    path = resolve_workspace_markdown(filename)
+    return path.read_text(encoding="utf-8")
+
+
+def write_workspace_markdown(filename: str, content: str) -> Path:
+    path = resolve_workspace_markdown(filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    return path
+
+
+def parse_set_md_payload(payload: str) -> tuple[str, str]:
+    stripped = payload.strip()
+    if not stripped:
+        raise ValueError("Usage: /set_md <FILE.md> followed by the full markdown content.")
+
+    parts = stripped.split(None, 1)
+    if len(parts) < 2:
+        raise ValueError("Usage: /set_md <FILE.md> followed by the full markdown content.")
+    filename, content = parts[0], parts[1].strip()
+    if not content:
+        raise ValueError("Markdown content must not be empty.")
+    return filename, content
+
+
+def parse_identity_payload(payload: str) -> dict[str, str]:
+    fields = {
+        "name": "",
+        "creature": "",
+        "vibe": "",
+        "emoji": "",
+        "avatar": "",
+    }
+    aliases = {
+        "name": "name",
+        "creature": "creature",
+        "vibe": "vibe",
+        "emoji": "emoji",
+        "avatar": "avatar",
+    }
+
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^\d+\.\s*", "", line)
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = key.strip().lower()
+        field_name = aliases.get(normalized_key)
+        if field_name:
+            fields[field_name] = value.strip().strip('"')
+
+    return fields
+
+
+def build_identity_markdown(fields: dict[str, str]) -> str:
+    return (
+        "# IDENTITY.md - Who Am I?\n\n"
+        "_Workspace identity for this nullclaw runtime._\n\n"
+        f"- **Name:** {fields['name']}\n"
+        f"- **Creature:** {fields['creature']}\n"
+        f"- **Vibe:** {fields['vibe']}\n"
+        f"- **Emoji:** {fields['emoji']}\n"
+        f"- **Avatar:** {fields['avatar']}\n\n"
+        "---\n\n"
+        "This file defines the runtime identity that nullclaw injects into the system prompt.\n"
+    )
+
+
 def build_help() -> str:
     return (
         f"🤖 <b>{escape(BOT_NAME)}</b>\n"
@@ -512,6 +683,9 @@ def build_help() -> str:
         "• <code>/agent &lt;message&gt;</code> — прямой запрос в nullclaw для memory/skills/tools\n"
         "• <code>/rag &lt;question&gt;</code> — ответ + проверка RAG hallucination\n"
         "• <code>/tool &lt;request&gt;</code> — tool call + schema/grounding checks\n"
+        "• <code>/show_md &lt;FILE.md&gt;</code> — показать workspace markdown файл\n"
+        "• <code>/set_md &lt;FILE.md&gt; ...</code> — детерминированно перезаписать workspace markdown файл\n"
+        "• <code>/set_identity ...</code> — обновить IDENTITY.md без участия модели\n"
         "• <code>/status</code> — состояние сервисов\n"
         "• <code>/help</code> — подсказка\n\n"
         "💡 В режиме <code>nullclaw</code> обычный текст идет как <code>/agent</code>. "
@@ -519,8 +693,84 @@ def build_help() -> str:
     )
 
 
+def build_bot_commands() -> list[BotCommand]:
+    return [
+        BotCommand(command="start", description="Start bot and show help"),
+        BotCommand(command="help", description="Show available commands"),
+        BotCommand(command="status", description="Check services and model status"),
+        BotCommand(command="agent", description="Send request to nullclaw agent"),
+        BotCommand(command="rag", description="Run RAG answer with hallucination check"),
+        BotCommand(command="tool", description="Run tool-calling evaluation"),
+        BotCommand(command="show_md", description="Show a workspace markdown file"),
+        BotCommand(command="set_md", description="Replace a workspace markdown file"),
+        BotCommand(command="set_identity", description="Update IDENTITY.md deterministically"),
+    ]
+
+
+def process_show_md(filename: str) -> str:
+    filename = filename.strip()
+    if not filename:
+        allowed = ", ".join(sorted(ALLOWED_WORKSPACE_MARKDOWN_FILES))
+        return f"⚠️ Usage: <code>/show_md FILE.md</code>\nAllowed: <code>{escape(allowed)}</code>"
+    try:
+        content = read_workspace_markdown(filename)
+    except FileNotFoundError:
+        return f"⚠️ File <code>{escape(filename)}</code> not found in workspace."
+    except ValueError as exc:
+        return f"⚠️ {escape(str(exc))}"
+
+    return (
+        f"📄 <b>{escape(filename)}</b>\n"
+        f"<blockquote>{escape(content)}</blockquote>"
+    )
+
+
+def process_set_md(payload: str) -> str:
+    try:
+        filename, content = parse_set_md_payload(payload)
+        path = write_workspace_markdown(filename, content)
+    except ValueError as exc:
+        return f"⚠️ {escape(str(exc))}"
+
+    return (
+        f"✅ Updated <code>{escape(path.name)}</code>\n\n"
+        f"<blockquote>{escape(content)}</blockquote>"
+    )
+
+
+def process_set_identity(payload: str) -> str:
+    if not payload.strip():
+        return (
+            "⚠️ Usage:\n"
+            "<blockquote>/set_identity\n"
+            "Name: Nullclaw AI moderation team\n"
+            "Creature: AI assistant\n"
+            "Vibe: warm\n"
+            "Emoji: ☺️\n"
+            "Avatar:</blockquote>"
+        )
+
+    fields = parse_identity_payload(payload)
+    if not fields["name"]:
+        return "⚠️ <code>Name:</code> is required for <code>/set_identity</code>."
+
+    content = build_identity_markdown(fields)
+    write_workspace_markdown("IDENTITY.md", content)
+    return (
+        "✅ Updated <code>IDENTITY.md</code>\n\n"
+        f"<blockquote>{escape(content)}</blockquote>"
+    )
+
+
 def process_rag(chat_id: int, question: str) -> str:
     question = question.strip()
+    routed_command, routed_payload = split_prefixed_command(question)
+    if routed_command == "agent":
+        return process_agent(chat_id, routed_payload)
+    if routed_command == "tool":
+        return process_tool(chat_id, routed_payload)
+    if routed_command == "rag":
+        question = routed_payload
     if not question:
         return "⚠️ Отправь <code>/rag твой вопрос</code>."
 
@@ -573,6 +823,13 @@ def render_observed_tool_calls(tool_calls: list[dict]) -> str:
 
 def process_agent(chat_id: int, request_text: str) -> str:
     request_text = request_text.strip()
+    routed_command, routed_payload = split_prefixed_command(request_text)
+    if routed_command == "rag":
+        return process_rag(chat_id, routed_payload)
+    if routed_command == "tool":
+        return process_tool(chat_id, routed_payload)
+    if routed_command == "agent":
+        request_text = routed_payload
     if not request_text:
         return "⚠️ Отправь <code>/agent твой запрос</code>."
 
@@ -610,6 +867,13 @@ def process_agent(chat_id: int, request_text: str) -> str:
 
 def process_tool(chat_id: int, request_text: str) -> str:
     request_text = request_text.strip()
+    routed_command, routed_payload = split_prefixed_command(request_text)
+    if routed_command == "agent":
+        return process_agent(chat_id, routed_payload)
+    if routed_command == "rag":
+        return process_rag(chat_id, routed_payload)
+    if routed_command == "tool":
+        request_text = routed_payload
     if not request_text:
         return "⚠️ Отправь <code>/tool твой запрос</code>."
 
@@ -647,7 +911,15 @@ def process_tool(chat_id: int, request_text: str) -> str:
     if not tool_calls:
         notes = message.get("content", "").strip() or "Model returned no tool call."
         empty_eval = (
-            build_nullclaw_tool_eval(run_id, [])
+            build_nullclaw_tool_eval(
+                run_id,
+                [],
+                observed_run_id=response.get("observed_run_id"),
+                observed_source=response.get("observed_source"),
+                observed_span_count=as_int(response.get("observed_span_count")),
+                observed_operations=response.get("observed_operations"),
+                observed_errors=response.get("observed_errors"),
+            )
             if LLM_BACKEND == "nullclaw"
             else ToolCallScorer(tools=TOOLS_SCHEMA).score(run_id=run_id)
         )
@@ -656,6 +928,7 @@ def process_tool(chat_id: int, request_text: str) -> str:
             "🛠️ <b>Tool Check</b>\n"
             f"Status: <b>{verdict_badge('fail')}</b>\n\n"
             "Модель не вернула tool call.\n\n"
+            f"🧭 <b>Diagnostic</b>\n<blockquote>{escape(empty_eval.notes or '')}</blockquote>\n\n"
             f"📄 <b>Raw response</b>\n<blockquote>{escape(notes)}</blockquote>"
         )
 
@@ -666,6 +939,8 @@ def process_tool(chat_id: int, request_text: str) -> str:
             observed_run_id=response.get("observed_run_id"),
             observed_source=response.get("observed_source"),
             observed_span_count=as_int(response.get("observed_span_count")),
+            observed_operations=response.get("observed_operations"),
+            observed_errors=response.get("observed_errors"),
         )
         if LLM_BACKEND == "nullclaw"
         else ToolCallScorer(tools=TOOLS_SCHEMA).score(run_id=run_id, tool_calls=tool_calls)
@@ -755,6 +1030,30 @@ async def tool_handler(message: Message) -> None:
     await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+@router.message(Command("show_md"))
+async def show_md_handler(message: Message) -> None:
+    text = message.text or ""
+    payload = text[len("/show_md") :].strip()
+    reply = await run_blocking(message, process_show_md, payload)
+    await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@router.message(Command("set_md"))
+async def set_md_handler(message: Message) -> None:
+    text = message.text or ""
+    payload = text[len("/set_md") :].strip()
+    reply = await run_blocking(message, process_set_md, payload)
+    await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@router.message(Command("set_identity"))
+async def set_identity_handler(message: Message) -> None:
+    text = message.text or ""
+    payload = text[len("/set_identity") :].strip()
+    reply = await run_blocking(message, process_set_identity, payload)
+    await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
 @router.message()
 async def fallback_handler(message: Message) -> None:
     if not message.text:
@@ -770,6 +1069,7 @@ async def amain() -> int:
     dp.include_router(router)
 
     print(f"🤖 Starting {BOT_NAME} with backend {LLM_BACKEND} and model {model_label()}")
+    await bot.set_my_commands(build_bot_commands())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
     return 0

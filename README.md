@@ -1,78 +1,100 @@
 # nullclaw-python-tg-bot
 
-Telegram bot for testing `nullwatch-py` hallucination detection with local models through Ollama or through `nullclaw` gateway.
+## Requirements
 
-The repository is intentionally lightweight: the main logic lives in `nullwatch-py`, while this repo is a runnable usage example with a Telegram UI built on `aiogram`.
-
-## Layout
-
-This repository is intended to live next to `nullwatch-py`:
+- Python 3.11+
+- Zig
+- Ollama
+- Pulled model, for example `qwen3:8b`
+- Running checkouts next to each other:
 
 ```text
-WB_HACKATON/
+local_folder/
+  nullwatch/
   nullwatch-py/
+  nullclaw/
+  nullclaw-test-home/
   nullclaw-python-tg-bot/
 ```
 
-When started from this layout, the bot can import the sibling `nullwatch-py` checkout automatically.
-
 ## Setup
 
-1. Create `.env` from `.env.example`
-2. Create a local `.venv` in this repository
-3. Install `aiogram` into that local environment
-4. Ensure Ollama is running and the model is pulled
-5. Start `nullwatch`
-6. Optionally start `nullclaw gateway` and switch `LLM_BACKEND=nullclaw`
-
 ```bash
-cd /nullclaw-python-tg-bot
+cd local_folder/nullclaw-python-tg-bot
+python3 -m venv .venv
+./.venv/bin/pip install aiogram python-dotenv
+cp .env.example .env
 ```
 
-Example:
-
-```bash
-cd /nullwatch
-zig build run -- serve
-```
-
-Optional `nullclaw` path:
-
-```bash
-cd /nullclaw
-CODEX_HOME=/nullclaw-test-home zig build run -- gateway
-```
-
-Then set these in `.env`:
+Recommended `.env` values:
 
 ```bash
 LLM_BACKEND=nullclaw
+OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:8b
+NULLWATCH_URL=http://127.0.0.1:7710
 NULLCLAW_URL=http://127.0.0.1:3000
-NULLCLAW_PAIRING_CODE=... # one-time code printed by gateway startup
 TOOL_GROUNDING_BACKEND=llm
 TOOL_GROUNDING_LLM_URL=http://127.0.0.1:11434/v1
-TOOL_GROUNDING_MODEL=qwen3:0.6b
+TOOL_GROUNDING_MODEL=qwen3:8b
 ```
 
+Also set:
+
+- `BOT_TOKEN`
+- `NULLCLAW_PAIRING_CODE` or `NULLCLAW_BEARER_TOKEN`
+
+## Start Processes
+
+1. Start `nullwatch` (In first terminal)
+
 ```bash
-cd /nullclaw-python-tg-bot
+cd local_folder/nullwatch
+zig build run -- serve
+```
+
+2. Start Ollama (In second terminal)
+
+```bash
+ollama serve
+```
+
+3. Start `nullclaw gateway` (In third terminal)
+
+```bash
+cd local_folder/nullclaw
+NULLCLAW_HOME=local_folder/nullclaw-test-home zig build run -- gateway
+```
+
+4. Start Telegram bot (In fourth terminal)
+
+```bash
+cd local_folder/nullclaw-python-tg-bot
 ./.venv/bin/python -u -m nullclaw_python_tg_bot
 ```
 
-## Commands
+## Stop Processes
 
-- `/agent remember that my name is Nikolay`
-- `/status`
-- `/rag Who created Zig?`
-- `/tool find documentation about Zig and Andrew Kelley`
+Stop running processes:
 
-Plain text is treated like `/agent` in `LLM_BACKEND=nullclaw` mode and like `/rag` in `LLM_BACKEND=ollama` mode.
+```bash
+pkill -f nullclaw_python_tg_bot || true
+lsof -ti tcp:3000 | xargs kill -9 2>/dev/null || true
+lsof -ti tcp:7710 | xargs kill -9 2>/dev/null || true
+lsof -ti tcp:11434 | xargs kill -9 2>/dev/null || true
+```
 
-## Notes
+Clean `nullclaw` runtime state:
 
-- In `LLM_BACKEND=ollama` mode, `/tool` validates raw OpenAI-style tool calls returned by the model.
-- In `LLM_BACKEND=nullclaw` mode, `/agent` is the main path for testing memory, skills, and general agent behavior.
-- In `LLM_BACKEND=nullclaw` mode, `/tool` evaluates observed tool execution events coming from `nullclaw` + `nullwatch`. This is closer to real agent behavior, but A2A responses do not expose the original OpenAI-style schema payload verbatim.
-- The bot correlates `nullclaw` gateway responses with recent OTEL runs in `nullwatch`, because current A2A spans do not carry a stable `session_id`.
-- For `nullclaw` mode, `TOOL_GROUNDING_BACKEND=llm` is recommended. It is slower than the keyword heuristic, but handles operational tool requests much better.
-- Tool execution still depends on the workspace configured for the running `nullclaw gateway`. If the gateway workspace is not your project root, shell/file tools may fail on `cwd` or allowed-path checks even though the SDK wiring itself is correct.
+```bash
+rm -f local_folder/nullclaw-test-home/workspace/memory/*.md
+rm -f local_folder/nullclaw-test-home/workspace/.nullclaw/workspace-state.json
+rm -f local_folder/nullclaw-test-home/daemon_state.json
+rm -f local_folder/nullclaw-test-home/llm_token_usage.jsonl
+```
+
+Clean `nullwatch` traces and evals:
+
+```bash
+rm -rf /Users/nikolayivanov/.nullwatch/data/*
+```
