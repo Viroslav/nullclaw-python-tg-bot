@@ -1,6 +1,6 @@
 services:
 
-  # ── 1. nullwatch — observability & eval backend ────────────────────────────
+  # 1. nullwatch — observability & eval backend
   nullwatch:
     build:
       # context is the repo root so we can COPY both docker/ and ../nullclaw's install-zig.sh
@@ -21,7 +21,7 @@ services:
       retries: 6
       start_period: 15s
 
-  # ── 2. ollama — local LLM runtime ─────────────────────────────────────────
+  # 2. ollama — local LLM runtime
   ollama:
     image: ollama/ollama:latest
     ports:
@@ -48,21 +48,21 @@ services:
       retries: 20
       start_period: 10s
 
-  # ── 3. pull the LLM model (runs once, then exits) ─────────────────────────
+  # 3. pull the LLM model (runs once, then exits)
   ollama-pull:
     image: ollama/ollama:latest
     depends_on:
       ollama:
         condition: service_healthy
     volumes:
-      - /Users/nikolayivanov/.ollama:/root/.ollama
+      - ollama-data:/root/.ollama
     environment:
       - OLLAMA_HOST=http://ollama:11434
     entrypoint: >
       sh -c "ollama pull ${OLLAMA_MODEL:-qwen3:8b} && echo 'Model ready.'"
     restart: "no"
 
-  # ── 4. nullclaw gateway — AI agent runtime ────────────────────────────────
+  # 4. nullclaw gateway — AI agent runtime
   nullclaw:
     image: ghcr.io/nullclaw/nullclaw:latest
     user: "0:0"
@@ -87,7 +87,7 @@ services:
       retries: 10
       start_period: 30s
 
-  # ── 5. Telegram bot + nullwatch-py SDK ────────────────────────────────────
+  # 5. Telegram bot + nullwatch-py SDK
   bot:
     build:
       # context is the repo root so COPY can reach ../nullwatch-py

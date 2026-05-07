@@ -43,6 +43,13 @@ from .nullclaw_gateway import NullclawGatewayClient, NullclawGatewayError  # noq
 
 load_dotenv()
 
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_NAME = os.getenv("BOT_NAME", "nullwatch-bot").strip()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -62,6 +69,7 @@ TOOL_GROUNDING_BACKEND = (
 )
 TOOL_GROUNDING_LLM_URL = os.getenv("TOOL_GROUNDING_LLM_URL", f"{OLLAMA_URL}/v1").rstrip("/")
 TOOL_GROUNDING_MODEL = os.getenv("TOOL_GROUNDING_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
+ENABLE_RAG_DETECTOR = env_flag("ENABLE_RAG_DETECTOR", True)
 NULLCLAW_HOME_DIR = Path(
     os.getenv(
         "NULLCLAW_HOME",
@@ -616,10 +624,6 @@ def parse_command(text: str) -> tuple[str, str]:
         return "help", ""
     if stripped.startswith("/status"):
         return "status", ""
-    if stripped.startswith("/agent "):
-        return "agent", stripped[7:].strip()
-    if stripped == "/agent":
-        return "agent", ""
     if stripped.startswith("/rag "):
         return "rag", stripped[5:].strip()
     if stripped == "/rag":
@@ -636,7 +640,7 @@ def split_prefixed_command(text: str) -> tuple[str | None, str]:
     if not stripped:
         return None, ""
 
-    for command in ("agent", "rag", "tool"):
+    for command in ("rag", "tool"):
         prefix = f"/{command}"
         if stripped == prefix:
             return command, ""
@@ -644,6 +648,39 @@ def split_prefixed_command(text: str) -> tuple[str | None, str]:
             return command, stripped[len(prefix) + 1 :].strip()
 
     return None, stripped
+
+
+def normalize_agent_request(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if stripped == "/agent":
+        return ""
+    if stripped.startswith("/agent "):
+        return stripped[7:].strip()
+    if stripped.startswith("/set_md"):
+        payload = stripped[len("/set_md") :].strip()
+        try:
+            filename, content = parse_set_md_payload(payload)
+        except ValueError:
+            return stripped
+        return (
+            f"Update the workspace markdown file {filename} with exactly the following content.\n\n"
+            f"{content}"
+        )
+    if stripped.startswith("/set_identity"):
+        payload = stripped[len("/set_identity") :].strip()
+        if not payload:
+            return (
+                "Update your IDENTITY.md. The user did not provide fields yet, "
+                "so ask a concise follow-up for the missing identity details."
+            )
+        return (
+            "Update your IDENTITY.md to match the following user-provided identity fields. "
+            "Persist the change in the workspace instead of only describing it.\n\n"
+            f"{payload}"
+        )
+    return stripped
 
 
 def resolve_workspace_markdown(filename: str) -> Path:
@@ -734,15 +771,14 @@ def build_help() -> str:
         f"Backend: <code>{escape(LLM_BACKEND)}</code>\n"
         f"Model: <code>{escape(model_label())}</code>\n\n"
         "Доступные команды:\n"
-        "• <code>/agent &lt;message&gt;</code> — прямой запрос в nullclaw для memory/skills/tools\n"
         "• <code>/rag &lt;question&gt;</code> — ответ + проверка RAG hallucination\n"
         "• <code>/tool &lt;request&gt;</code> — tool call + schema/grounding checks\n"
         "• <code>/show_md &lt;FILE.md&gt;</code> — показать workspace markdown файл\n"
-        "• <code>/set_md &lt;FILE.md&gt; ...</code> — детерминированно перезаписать workspace markdown файл\n"
-        "• <code>/set_identity ...</code> — обновить IDENTITY.md без участия модели\n"
         "• <code>/status</code> — состояние сервисов\n"
         "• <code>/help</code> — подсказка\n\n"
-        "💡 В режиме <code>nullclaw</code> обычный текст идет как <code>/agent</code>. "
+        "💡 В режиме <code>nullclaw</code> обычный текст идет прямо агенту. "
+        "Если попросить его запомнить что-то или обновить <code>IDENTITY.md</code>/<code>TOOLS.md</code>, "
+        "он должен сделать это сам через memory/tools. "
         "В режиме <code>ollama</code> обычный текст считается как <code>/rag</code>."
     )
 
@@ -752,12 +788,9 @@ def build_bot_commands() -> list[BotCommand]:
         BotCommand(command="start", description="Start bot and show help"),
         BotCommand(command="help", description="Show available commands"),
         BotCommand(command="status", description="Check services and model status"),
-        BotCommand(command="agent", description="Send request to nullclaw agent"),
         BotCommand(command="rag", description="Run RAG answer with hallucination check"),
         BotCommand(command="tool", description="Run tool-calling evaluation"),
         BotCommand(command="show_md", description="Show a workspace markdown file"),
-        BotCommand(command="set_md", description="Replace a workspace markdown file"),
-        BotCommand(command="set_identity", description="Update IDENTITY.md deterministically"),
     ]
 
 
@@ -819,8 +852,6 @@ def process_set_identity(payload: str) -> str:
 def process_rag(chat_id: int, question: str) -> str:
     question = question.strip()
     routed_command, routed_payload = split_prefixed_command(question)
-    if routed_command == "agent":
-        return process_agent(chat_id, routed_payload)
     if routed_command == "tool":
         return process_tool(chat_id, routed_payload)
     if routed_command == "rag":
@@ -842,13 +873,36 @@ def process_rag(chat_id: int, question: str) -> str:
         span.input_tokens = response.get("prompt_eval_count")
         span.output_tokens = response.get("eval_count")
 
-    eval_result = RAGHallucinationScorer().score(
-        run_id=run_id,
-        contexts=contexts,
-        question=question,
-        answer=answer,
-    )
-    client.ingest_eval(eval_result)
+    eval_result = None
+    rag_error = ""
+    if not ENABLE_RAG_DETECTOR:
+        rag_error = (
+            "RAG hallucination detector is disabled by configuration. "
+            "Set ENABLE_RAG_DETECTOR=true to enable it."
+        )
+    else:
+        try:
+            eval_result = RAGHallucinationScorer().score(
+                run_id=run_id,
+                contexts=contexts,
+                question=question,
+                answer=answer,
+            )
+        except ImportError as exc:
+            rag_error = str(exc)
+        else:
+            client.ingest_eval(eval_result)
+
+    if eval_result is None:
+        return (
+            "🧠 <b>RAG Check</b>\n"
+            "Status: <b>⚠️ UNAVAILABLE</b>\n\n"
+            f"❓ <b>Question</b>\n<blockquote>{escape(question)}</blockquote>\n\n"
+            f"💬 <b>Answer</b>\n<blockquote>{escape(answer)}</blockquote>\n\n"
+            "🔎 <b>Detector</b>\n"
+            f"<blockquote>{escape(rag_error or 'RAG hallucination detector is unavailable in this runtime.')}</blockquote>\n\n"
+            f"📚 <b>Context</b>\n<blockquote>{escape(format_context(contexts))}</blockquote>"
+        )
 
     return (
         f"🧠 <b>RAG Check</b>\n"
@@ -876,16 +930,22 @@ def render_observed_tool_calls(tool_calls: list[dict]) -> str:
 
 
 def process_agent_with_run_id(run_id: str, chat_id: int, request_text: str) -> str:
-    request_text = request_text.strip()
+    request_text = normalize_agent_request(request_text)
     routed_command, routed_payload = split_prefixed_command(request_text)
     if routed_command == "rag":
         return process_rag(chat_id, routed_payload)
     if routed_command == "tool":
         return process_tool(chat_id, routed_payload)
-    if routed_command == "agent":
-        request_text = routed_payload
     if not request_text:
-        return "⚠️ Отправь <code>/agent твой запрос</code>."
+        return "⚠️ Отправь обычное сообщение для агента."
+
+    request_text = (
+        "Agent behavior notes:\n"
+        "- Treat user requests to remember something as a request to persist it in durable memory.\n"
+        "- If the user asks to update identity or workspace markdown instructions, make the change yourself via tools.\n"
+        "- Prefer editing the appropriate workspace files or memory entries over only promising to do it.\n\n"
+        f"User message:\n{request_text}"
+    )
 
     with client.span(run_id, "agent.chat", source="telegram-bot", model=model_label()) as span:
         response = invoke_model(run_id, [{"role": "user", "content": request_text}])
@@ -1005,8 +1065,6 @@ async def follow_up_nullclaw_result(
 def process_tool(chat_id: int, request_text: str) -> str:
     request_text = request_text.strip()
     routed_command, routed_payload = split_prefixed_command(request_text)
-    if routed_command == "agent":
-        return process_agent(chat_id, routed_payload)
     if routed_command == "rag":
         return process_rag(chat_id, routed_payload)
     if routed_command == "tool":
@@ -1123,6 +1181,7 @@ def process_status() -> str:
         f"nullclaw: <b>{status_badge(nullclaw_ok)}</b>\n"
         f"Model: <code>{escape(model_label())}</code>\n"
         f"nullwatch: <b>{status_badge(nullwatch_ok)}</b>\n"
+        f"RAG detector: <code>{escape('enabled' if ENABLE_RAG_DETECTOR else 'disabled')}</code>\n"
         f"Bot: <code>{escape(BOT_NAME)}</code>"
     )
 
@@ -1195,15 +1254,6 @@ async def status_handler(message: Message) -> None:
     await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
-@router.message(Command("agent"))
-async def agent_handler(message: Message) -> None:
-    command, payload = parse_command(message.text or "")
-    del command
-    run_id = build_run_id("agent", message.chat.id)
-    reply = await run_blocking(message, process_agent_with_run_id, run_id, message.chat.id, payload)
-    await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-
 @router.message(Command("rag"))
 async def rag_handler(message: Message) -> None:
     command, payload = parse_command(message.text or "")
@@ -1225,22 +1275,6 @@ async def show_md_handler(message: Message) -> None:
     text = message.text or ""
     payload = text[len("/show_md") :].strip()
     reply = await run_blocking(message, process_show_md, payload)
-    await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-
-@router.message(Command("set_md"))
-async def set_md_handler(message: Message) -> None:
-    text = message.text or ""
-    payload = text[len("/set_md") :].strip()
-    reply = await run_blocking(message, process_set_md, payload)
-    await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-
-@router.message(Command("set_identity"))
-async def set_identity_handler(message: Message) -> None:
-    text = message.text or ""
-    payload = text[len("/set_identity") :].strip()
-    reply = await run_blocking(message, process_set_identity, payload)
     await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 

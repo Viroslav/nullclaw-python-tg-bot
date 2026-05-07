@@ -11,15 +11,32 @@ from nullclaw_python_tg_bot import bot  # noqa: E402
 
 
 class SplitPrefixedCommandTests(unittest.TestCase):
-    def test_agent_prefix_is_split(self):
-        command, payload = bot.split_prefixed_command("/agent remember me")
-        self.assertEqual(command, "agent")
-        self.assertEqual(payload, "remember me")
-
     def test_plain_text_is_not_treated_as_prefixed_command(self):
         command, payload = bot.split_prefixed_command("remember me")
         self.assertIsNone(command)
         self.assertEqual(payload, "remember me")
+
+    def test_agent_prefix_is_left_for_agent_normalization(self):
+        command, payload = bot.split_prefixed_command("/agent remember me")
+        self.assertIsNone(command)
+        self.assertEqual(payload, "/agent remember me")
+
+
+class NormalizeAgentRequestTests(unittest.TestCase):
+    def test_agent_prefix_becomes_plain_message(self):
+        self.assertEqual(bot.normalize_agent_request("/agent remember me"), "remember me")
+
+    def test_set_md_becomes_plain_instruction(self):
+        normalized = bot.normalize_agent_request("/set_md TOOLS.md\n# TOOLS\nprefer calculator")
+
+        self.assertIn("Update the workspace markdown file TOOLS.md", normalized)
+        self.assertIn("prefer calculator", normalized)
+
+    def test_set_identity_becomes_plain_instruction(self):
+        normalized = bot.normalize_agent_request("/set_identity Name: Test Agent")
+
+        self.assertIn("Update your IDENTITY.md", normalized)
+        self.assertIn("Name: Test Agent", normalized)
 
 
 class BotCommandsTests(unittest.TestCase):
@@ -33,12 +50,9 @@ class BotCommandsTests(unittest.TestCase):
                 ("start", "Start bot and show help"),
                 ("help", "Show available commands"),
                 ("status", "Check services and model status"),
-                ("agent", "Send request to nullclaw agent"),
                 ("rag", "Run RAG answer with hallucination check"),
                 ("tool", "Run tool-calling evaluation"),
                 ("show_md", "Show a workspace markdown file"),
-                ("set_md", "Replace a workspace markdown file"),
-                ("set_identity", "Update IDENTITY.md deterministically"),
             ],
         )
 
@@ -86,19 +100,51 @@ class WorkspaceMarkdownTests(unittest.TestCase):
 
 
 class ProcessorRoutingTests(unittest.TestCase):
-    def test_process_rag_reroutes_agent_command(self):
-        with patch.object(bot, "process_agent", return_value="agent-result") as mock_agent:
-            result = bot.process_rag(1, "/agent remember that my name is Nikolay")
-
-        self.assertEqual(result, "agent-result")
-        mock_agent.assert_called_once_with(1, "remember that my name is Nikolay")
-
     def test_process_tool_reroutes_rag_command(self):
         with patch.object(bot, "process_rag", return_value="rag-result") as mock_rag:
             result = bot.process_tool(1, "/rag who created zig?")
 
         self.assertEqual(result, "rag-result")
         mock_rag.assert_called_once_with(1, "who created zig?")
+
+    def test_process_agent_normalizes_legacy_agent_prefix(self):
+        with patch.object(bot, "invoke_model", return_value={"message": {"content": "ok", "tool_calls": []}}):
+            reply = bot.process_agent_with_run_id("run-1", 1, "/agent remember that my name is Nikolay")
+
+        self.assertIn("remember that my name is Nikolay", reply)
+
+    def test_process_rag_gracefully_handles_missing_detector_dependency(self):
+        fake_response = {
+            "message": {"content": "Andrew Kelley created Zig."},
+            "prompt_eval_count": 10,
+            "eval_count": 5,
+        }
+        with patch.object(bot, "invoke_model", return_value=fake_response):
+            with patch.object(bot, "ENABLE_RAG_DETECTOR", True):
+                with patch.object(
+                    bot.RAGHallucinationScorer,
+                    "score",
+                    side_effect=ImportError("lettucedetect is required: pip install lettucedetect"),
+                ):
+                    reply = bot.process_rag(1, "who created zig?")
+
+        self.assertIn("UNAVAILABLE", reply)
+        self.assertIn("Andrew Kelley created Zig.", reply)
+        self.assertIn("lettucedetect is required", reply)
+
+    def test_process_rag_reports_disabled_detector(self):
+        fake_response = {
+            "message": {"content": "Andrew Kelley created Zig."},
+            "prompt_eval_count": 10,
+            "eval_count": 5,
+        }
+        with patch.object(bot, "invoke_model", return_value=fake_response):
+            with patch.object(bot, "ENABLE_RAG_DETECTOR", False):
+                reply = bot.process_rag(1, "who created zig?")
+
+        self.assertIn("UNAVAILABLE", reply)
+        self.assertIn("disabled by configuration", reply)
+
 
 
 class NullclawToolEvalTests(unittest.TestCase):

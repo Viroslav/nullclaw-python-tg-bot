@@ -85,6 +85,8 @@ Copy `.env.example` → `.env` and set:
 | `OLLAMA_MODEL` | | `qwen3:8b` | Model to use and pull |
 | `LLM_BACKEND` | | `nullclaw` | `nullclaw` or `ollama` |
 | `TOOL_GROUNDING_BACKEND` | | `llm` | `llm` or `keyword` |
+| `ENABLE_RAG_DETECTOR` | | `true` | Enables LettuceDetect-based `/rag` hallucination scoring |
+| `HF_TOKEN` | | *(empty)* | Optional Hugging Face token for higher rate limits and faster model downloads |
 | `NULLCLAW_PAIRING_CODE` | | *(empty)* | Leave empty — pairing disabled by default |
 
 Service URLs (nullwatch, nullclaw, ollama) are automatically set to Docker service names inside the compose network. Only override them for local development without Docker.
@@ -95,20 +97,23 @@ The Docker stack creates the `nullclaw` home and workspace volumes automatically
 
 | Command | Description |
 |---|---|
-| `/agent <message>` | Send request to nullclaw agent (memory + tools) |
 | `/rag <question>` | Answer from context + RAG hallucination check |
 | `/tool <request>` | Tool call + schema and grounding validation |
 | `/show_md <FILE.md>` | Show agent workspace markdown file |
-| `/set_md <FILE.md> ...` | Overwrite workspace markdown file |
-| `/set_identity ...` | Update agent IDENTITY.md |
 | `/status` | Health check for all services |
+
+In `nullclaw` mode, plain text messages go directly to the agent. If you ask it to remember something or update `IDENTITY.md` / other workspace markdown files, it should do that itself via memory/tools instead of separate admin commands.
+
+`/rag` always produces an answer. Hallucination scoring is enabled by default and controlled by `ENABLE_RAG_DETECTOR`. If the detector is enabled but its heavy dependencies are not installed in the current runtime, the bot returns a clear `UNAVAILABLE` detector status instead of crashing.
+
+If you see Hugging Face rate-limit warnings while the detector model is downloading, add `HF_TOKEN=...` to `.env`. The `bot` container already receives all values from `.env` via `env_file`, so no `docker-compose.yml` change is required.
 
 ## Local development (without Docker)
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install aiogram python-dotenv
-pip install -e ../nullwatch-py   # install SDK in editable mode
+.venv/bin/pip install -r requirements.txt
+pip install -r ../nullwatch-py/requirements.txt
 
 cp .env.example .env
 # edit .env, then run services manually:
