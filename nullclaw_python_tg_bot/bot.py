@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+import traceback
 import urllib.request
 from pathlib import Path
 from typing import Iterable
@@ -52,6 +53,9 @@ NULLCLAW_URL = os.getenv("NULLCLAW_URL", "http://127.0.0.1:3000").rstrip("/")
 NULLCLAW_PAIRING_CODE = os.getenv("NULLCLAW_PAIRING_CODE", "").strip()
 NULLCLAW_BEARER_TOKEN = os.getenv("NULLCLAW_BEARER_TOKEN", "").strip()
 NULLCLAW_CHANNEL = os.getenv("NULLCLAW_CHANNEL", "nullwatch-bot").strip() or "nullwatch-bot"
+NULLCLAW_TIMEOUT_SECS = int(os.getenv("NULLCLAW_TIMEOUT_SECS", "180"))
+NULLCLAW_FOLLOWUP_TIMEOUT_SECS = int(os.getenv("NULLCLAW_FOLLOWUP_TIMEOUT_SECS", "600"))
+NULLCLAW_FOLLOWUP_POLL_SECS = float(os.getenv("NULLCLAW_FOLLOWUP_POLL_SECS", "3"))
 TOOL_GROUNDING_BACKEND = (
     os.getenv("TOOL_GROUNDING_BACKEND", "llm" if LLM_BACKEND == "nullclaw" else "keyword").strip().lower()
     or ("llm" if LLM_BACKEND == "nullclaw" else "keyword")
@@ -154,6 +158,7 @@ nullclaw = NullclawGatewayClient(
     base_url=NULLCLAW_URL,
     pairing_code=NULLCLAW_PAIRING_CODE,
     bearer_token=NULLCLAW_BEARER_TOKEN,
+    timeout=NULLCLAW_TIMEOUT_SECS,
     default_channel=NULLCLAW_CHANNEL,
 )
 
@@ -191,6 +196,10 @@ def model_label() -> str:
 
 def build_session_key(run_id: str) -> str:
     return nullclaw.build_session_key(run_id)
+
+
+def build_run_id(kind: str, chat_id: int) -> str:
+    return f"{RUN_PREFIX}-{kind}-{chat_id}-{int(time.time())}"
 
 
 def as_int(value: object, default: int = 0) -> int:
@@ -866,7 +875,7 @@ def render_observed_tool_calls(tool_calls: list[dict]) -> str:
     return chr(10).join(rendered_calls)
 
 
-def process_agent(chat_id: int, request_text: str) -> str:
+def process_agent_with_run_id(run_id: str, chat_id: int, request_text: str) -> str:
     request_text = request_text.strip()
     routed_command, routed_payload = split_prefixed_command(request_text)
     if routed_command == "rag":
@@ -878,7 +887,6 @@ def process_agent(chat_id: int, request_text: str) -> str:
     if not request_text:
         return "⚠️ Отправь <code>/agent твой запрос</code>."
 
-    run_id = f"{RUN_PREFIX}-agent-{chat_id}-{int(time.time())}"
     with client.span(run_id, "agent.chat", source="telegram-bot", model=model_label()) as span:
         response = invoke_model(run_id, [{"role": "user", "content": request_text}])
         span.input_tokens = response.get("prompt_eval_count")
@@ -908,6 +916,90 @@ def process_agent(chat_id: int, request_text: str) -> str:
             ]
         )
     return "\n".join(parts)
+
+
+def process_agent(chat_id: int, request_text: str) -> str:
+    return process_agent_with_run_id(build_run_id("agent", chat_id), chat_id, request_text)
+
+
+def latest_nullclaw_task_for_context(context_id: str) -> dict | None:
+    tasks = nullclaw.list_tasks(context_id=context_id, history_length=1, page_size=10)
+    if not tasks:
+        return None
+
+    def sort_key(task: dict) -> str:
+        status = task.get("status")
+        if isinstance(status, dict):
+            timestamp = status.get("timestamp")
+            if isinstance(timestamp, str):
+                return timestamp
+        return ""
+
+    filtered = [task for task in tasks if isinstance(task, dict)]
+    if not filtered:
+        return None
+    return max(filtered, key=sort_key)
+
+
+async def follow_up_nullclaw_result(
+    tg_bot: Bot,
+    *,
+    chat_id: int,
+    message_thread_id: int | None,
+    run_id: str,
+) -> None:
+    deadline = time.time() + NULLCLAW_FOLLOWUP_TIMEOUT_SECS
+    while time.time() < deadline:
+        try:
+            task = await asyncio.to_thread(latest_nullclaw_task_for_context, run_id)
+        except Exception as exc:
+            print(f"follow-up polling failed for {run_id}: {exc}")
+            await asyncio.sleep(NULLCLAW_FOLLOWUP_POLL_SECS)
+            continue
+
+        if not task:
+            await asyncio.sleep(NULLCLAW_FOLLOWUP_POLL_SECS)
+            continue
+
+        status = task.get("status")
+        state = ""
+        if isinstance(status, dict) and isinstance(status.get("state"), str):
+            state = status["state"]
+
+        if state == "completed":
+            text = strip_thinking(nullclaw.extract_task_text(task))
+            if not text:
+                text = "The task completed, but nullclaw returned an empty final message."
+            await tg_bot.send_message(
+                chat_id,
+                "✅ <b>Delayed Result</b>\n\n" + escape(text),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                message_thread_id=message_thread_id,
+            )
+            return
+
+        if state in {"failed", "canceled", "rejected"}:
+            await tg_bot.send_message(
+                chat_id,
+                "⚠️ <b>Delayed Result Failed</b>\n"
+                f"<blockquote>Final task state: {escape(state)}</blockquote>",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                message_thread_id=message_thread_id,
+            )
+            return
+
+        await asyncio.sleep(NULLCLAW_FOLLOWUP_POLL_SECS)
+
+    await tg_bot.send_message(
+        chat_id,
+        "⏳ <b>No Delayed Result Yet</b>\n"
+        "The task is still not in a terminal state. Try a shorter prompt or a smaller model.",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        message_thread_id=message_thread_id,
+    )
 
 
 def process_tool(chat_id: int, request_text: str) -> str:
@@ -1035,9 +1127,61 @@ def process_status() -> str:
     )
 
 
+def build_runtime_error_reply(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return (
+            "⏳ <b>Request Timed Out</b>\n"
+            "The agent did not answer before the bot timeout expired.\n\n"
+            f"Current timeout: <code>{NULLCLAW_TIMEOUT_SECS}s</code>\n"
+            "Try a shorter prompt, switch to a smaller model, or raise <code>NULLCLAW_TIMEOUT_SECS</code>."
+        )
+
+    if isinstance(exc, NullclawGatewayError):
+        detail = str(exc)
+        if "timed out" in detail.lower():
+            return (
+                "⏳ <b>Agent Is Still Thinking</b>\n"
+                f"<blockquote>{escape(detail)}</blockquote>\n\n"
+                "The request reached nullclaw, but the synchronous reply did not arrive in time."
+            )
+        return (
+            "⚠️ <b>Gateway Error</b>\n"
+            f"<blockquote>{escape(detail)}</blockquote>"
+        )
+
+    return (
+        "⚠️ <b>Unexpected Error</b>\n"
+        f"<blockquote>{escape(type(exc).__name__)}: {escape(str(exc) or 'no details')}</blockquote>"
+    )
+
+
 async def run_blocking(message: Message, fn, *args) -> str:
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING, message_thread_id=message.message_thread_id)
-    return await asyncio.to_thread(fn, *args)
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except Exception as exc:
+        print(f"bot handler error in {getattr(fn, '__name__', '<callable>')}: {exc}")
+        traceback.print_exc()
+        if (
+            isinstance(exc, NullclawGatewayError)
+            and "timed out" in str(exc).lower()
+            and getattr(fn, "__name__", "") == "process_agent_with_run_id"
+            and args
+        ):
+            run_id = str(args[0])
+            asyncio.create_task(
+                follow_up_nullclaw_result(
+                    message.bot,
+                    chat_id=message.chat.id,
+                    message_thread_id=message.message_thread_id,
+                    run_id=run_id,
+                )
+            )
+            return (
+                build_runtime_error_reply(exc)
+                + "\n\nI will keep polling nullclaw and send a follow-up message if the task completes."
+            )
+        return build_runtime_error_reply(exc)
 
 
 @router.message(Command("start", "help"))
@@ -1055,7 +1199,8 @@ async def status_handler(message: Message) -> None:
 async def agent_handler(message: Message) -> None:
     command, payload = parse_command(message.text or "")
     del command
-    reply = await run_blocking(message, process_agent, message.chat.id, payload)
+    run_id = build_run_id("agent", message.chat.id)
+    reply = await run_blocking(message, process_agent_with_run_id, run_id, message.chat.id, payload)
     await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
@@ -1103,8 +1248,11 @@ async def set_identity_handler(message: Message) -> None:
 async def fallback_handler(message: Message) -> None:
     if not message.text:
         return
-    processor = process_agent if LLM_BACKEND == "nullclaw" else process_rag
-    reply = await run_blocking(message, processor, message.chat.id, message.text)
+    if LLM_BACKEND == "nullclaw":
+        run_id = build_run_id("agent", message.chat.id)
+        reply = await run_blocking(message, process_agent_with_run_id, run_id, message.chat.id, message.text)
+    else:
+        reply = await run_blocking(message, process_rag, message.chat.id, message.text)
     await message.answer(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 

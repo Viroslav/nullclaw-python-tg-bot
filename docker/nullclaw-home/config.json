@@ -1,0 +1,45 @@
+{
+  "models": {
+    "providers": {
+      "ollama": {
+        "base_url": "http://172.28.0.10:11434"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "ollama/qwen3:8b"
+      }
+    }
+  },
+  "channels": {
+    "cli": false
+  },
+  "gateway": {
+    "require_pairing": true,
+    "port": 3000,
+    "host": "::",
+    "allow_public_bind": true,
+    "paired_tokens": ["nullclaw-local-dev-token"]
+  },
+  "a2a": {
+    "enabled": true,
+    "name": "nullclaw-hackathon",
+    "description": "Hackathon Docker gateway",
+    "version": "0.3.0"
+  },
+  "memory": {
+    "backend": "markdown",
+    "auto_save": true
+  },
+  "diagnostics": {
+    "backend": "otel",
+    "log_tool_calls": true,
+    "log_llm_io": true,
+    "otel": {
+      "endpoint": "http://nullwatch:7710",
+      "service_name": "nullclaw-hackathon"
+    }
+  }
+}

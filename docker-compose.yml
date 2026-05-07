@@ -1,0 +1,123 @@
+services:
+
+  # ── 1. nullwatch — observability & eval backend ────────────────────────────
+  nullwatch:
+    build:
+      # context is the repo root so we can COPY both docker/ and ../nullclaw's install-zig.sh
+      context: ..
+      dockerfile: nullclaw-python-tg-bot/docker/Dockerfile.nullwatch
+      args:
+        - ZIG_VERSION=0.16.0
+    image: nullwatch-local:latest
+    ports:
+      - "127.0.0.1:7710:7710"
+    volumes:
+      - nullwatch-data:/nullwatch-data/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7710/health >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # ── 2. ollama — local LLM runtime ─────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "127.0.0.1:11434:11434"
+    networks:
+      default:
+        ipv4_address: 172.28.0.10
+    volumes:
+      # Test setup: reuse the host Ollama cache to avoid re-downloading models.
+      - /Users/nikolayivanov/.ollama:/root/.ollama
+    restart: unless-stopped
+    # GPU support — uncomment for NVIDIA:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ── 3. pull the LLM model (runs once, then exits) ─────────────────────────
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - /Users/nikolayivanov/.ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: >
+      sh -c "ollama pull ${OLLAMA_MODEL:-qwen3:8b} && echo 'Model ready.'"
+    restart: "no"
+
+  # ── 4. nullclaw gateway — AI agent runtime ────────────────────────────────
+  nullclaw:
+    image: ghcr.io/nullclaw/nullclaw:latest
+    user: "0:0"
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      nullwatch:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+    volumes:
+      - nullclaw-data:/nullclaw-data
+      - ./docker/nullclaw-home/config.json:/nullclaw-data/config.json:ro
+      - nullclaw-workspace:/nullclaw-data/workspace
+    environment:
+      - NULLCLAW_HOME=/nullclaw-data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── 5. Telegram bot + nullwatch-py SDK ────────────────────────────────────
+  bot:
+    build:
+      # context is the repo root so COPY can reach ../nullwatch-py
+      context: ..
+      dockerfile: nullclaw-python-tg-bot/Dockerfile
+    depends_on:
+      nullwatch:
+        condition: service_healthy
+      nullclaw:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - NULLWATCH_URL=http://nullwatch:7710
+      - NULLCLAW_URL=http://nullclaw:3000
+      - NULLCLAW_BEARER_TOKEN=nullclaw-local-dev-token
+      - OLLAMA_URL=http://ollama:11434
+      - TOOL_GROUNDING_LLM_URL=http://ollama:11434/v1
+    volumes:
+      - nullclaw-workspace:/nullclaw-home/workspace
+    restart: unless-stopped
+
+volumes:
+  nullwatch-data:
+  ollama-data:
+  nullclaw-data:
+  nullclaw-workspace:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

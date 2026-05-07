@@ -115,6 +115,30 @@ class NullclawToolEvalTests(unittest.TestCase):
         self.assertIn("AllProvidersFailed", eval_.notes)
 
 
+class RuntimeErrorReplyTests(unittest.TestCase):
+    def test_timeout_reply_mentions_timeout_env(self):
+        reply = bot.build_runtime_error_reply(TimeoutError("timed out"))
+
+        self.assertIn("Request Timed Out", reply)
+        self.assertIn("NULLCLAW_TIMEOUT_SECS", reply)
+
+    def test_gateway_reply_renders_detail(self):
+        reply = bot.build_runtime_error_reply(
+            bot.NullclawGatewayError("nullclaw gateway POST /a2a failed with 401: unauthorized")
+        )
+
+        self.assertIn("Gateway Error", reply)
+        self.assertIn("401", reply)
+
+
+class RunIdTests(unittest.TestCase):
+    def test_build_run_id_contains_kind_and_chat(self):
+        run_id = bot.build_run_id("agent", 42)
+
+        self.assertIn("agent", run_id)
+        self.assertIn("42", run_id)
+
+
 class RunCorrelationTests(unittest.TestCase):
     def test_request_hint_wins_over_newer_unrelated_run(self):
         matching_run = [

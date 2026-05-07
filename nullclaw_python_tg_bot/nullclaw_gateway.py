@@ -52,15 +52,24 @@ class NullclawGatewayClient:
                 return json.loads(raw) if raw else {}
         except HTTPError as exc:
             detail = exc.read().decode()
+            if exc.code == 503 and not detail.strip():
+                detail = (
+                    "gateway is reachable but not ready yet; "
+                    "check GET /ready and ensure the configured model is available in Ollama"
+                )
             raise NullclawGatewayError(
                 f"nullclaw gateway {method} {path} failed with {exc.code}: {detail}"
+            ) from exc
+        except TimeoutError as exc:
+            raise NullclawGatewayError(
+                f"nullclaw gateway {method} {path} timed out after {self.timeout}s"
             ) from exc
         except URLError as exc:
             raise NullclawGatewayError(f"Cannot reach nullclaw at {self.base_url}: {exc.reason}") from exc
 
     def is_alive(self) -> bool:
         try:
-            self._request("GET", "/health")
+            self._request("GET", "/ready")
             return True
         except Exception:
             return False
@@ -119,6 +128,40 @@ class NullclawGatewayClient:
             "task": result,
             "raw_response": response,
         }
+
+    def list_tasks(
+        self,
+        *,
+        context_id: str,
+        state: str | None = None,
+        history_length: int = 1,
+        page_size: int = 10,
+    ) -> list[dict[str, Any]]:
+        headers: dict[str, str] = {}
+        if self.bearer_token or self.pairing_code:
+            headers["Authorization"] = f"Bearer {self.ensure_token()}"
+
+        params: dict[str, Any] = {
+            "contextId": context_id,
+            "historyLength": history_length,
+            "pageSize": page_size,
+        }
+        if state:
+            params["state"] = state
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": f"tasks-{context_id}",
+            "method": "tasks/list",
+            "params": params,
+        }
+        response = self._request("POST", "/a2a", body=payload, headers=headers)
+        result = response.get("result", {}) if isinstance(response, dict) else {}
+        tasks = result.get("tasks", [])
+        return tasks if isinstance(tasks, list) else []
+
+    def extract_task_text(self, task: dict[str, Any]) -> str:
+        return self._extract_text(task)
 
     def _extract_text(self, result: dict[str, Any]) -> str:
         artifacts = result.get("artifacts")

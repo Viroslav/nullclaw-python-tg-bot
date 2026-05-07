@@ -1,100 +1,149 @@
 # nullclaw-python-tg-bot
 
-## Requirements
+Telegram bot that connects [nullclaw](https://github.com/nullclaw/nullclaw) to [nullwatch-py](https://github.com/nullclaw/nullwatch-python-sdk), demonstrating RAG hallucination detection and tool-call grounding scoring for AI agents.
 
-- Python 3.11+
-- Zig
-- Ollama
-- Pulled model, for example `qwen3:8b`
-- Running checkouts next to each other:
+`nullwatch-py` is an SDK, not a standalone daemon. In this stack it runs inside the bot container and sends spans/evals to the separate `nullwatch` backend service.
+
+## Stack
+
+| Service    | What it does                                              |
+|------------|-----------------------------------------------------------|
+| `nullwatch`| Observability backend — ingests spans and evals (port 7710) |
+| `ollama`   | Local LLM runtime (port 11434)                           |
+| `nullclaw` | AI agent gateway — memory, tools, A2A protocol (port 3000)|
+| `bot`      | This Telegram bot, with [nullwatch-py](https://github.com/nullclaw/nullwatch-python-sdk) SDK |
+
+## Quick start (Docker)
+
+Requires:
+- [Docker Desktop](https://docs.docker.com/get-docker/)
+- a sibling checkout of `../nullwatch-py` so the bot image can install the local SDK source
+
+Optional for local non-Docker development:
+- `../nullclaw`
+- `../nullwatch`
+
+During `docker compose up --build` the images pull/build everything automatically:
+- `nullwatch` — cloned from GitHub and compiled with Zig 0.16.0 inside Docker
+- `nullclaw` — pulled as `ghcr.io/nullclaw/nullclaw:latest`
+- `nullwatch-py` SDK — installed from the local sibling repo `../nullwatch-py`
+- `ollama` + model — pulled and downloaded on first start
+
+```bash
+cd nullclaw-python-tg-bot
+
+# 1. First-time setup (copies nullwatch-py, creates .env)
+bash setup.sh
+
+# 2. Fill in your Telegram bot token
+echo 'BOT_TOKEN=your_token_here' >> .env
+
+# 3. Start everything
+docker compose up -d
+
+# 4. Check status
+docker compose ps
+docker compose logs -f bot
+```
+
+First start downloads ~5 GB for `qwen3:8b`, so `docker compose up` may appear "stuck" for a long time while `ollama-pull` is still running. Check progress with `docker compose logs -f ollama-pull`.
+
+`nullclaw` is considered healthy only after `GET /ready` returns `200 OK`. This avoids a common failure mode where `/health` is up but `/a2a` still answers `503 Service Unavailable`.
+
+### Useful commands
+
+```bash
+docker compose logs -f          # all logs
+docker compose logs -f bot      # bot only
+docker compose ps               # health status
+docker compose down             # stop (data preserved)
+docker compose down -v          # full reset (deletes all data)
+```
+
+Or via `make`:
+
+```bash
+make setup    # first-time setup
+make up       # start
+make down     # stop
+make logs     # follow logs
+make logs-bot # bot logs only
+make status   # health
+make build    # rebuild after code changes
+make reset-nullwatch   # wipe trace data only
+make reset-nullclaw    # wipe agent memory only
+make clean    # full reset
+```
+
+## Configuration
+
+Copy `.env.example` → `.env` and set:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `BOT_TOKEN` | ✅ | — | From @BotFather |
+| `OLLAMA_MODEL` | | `qwen3:8b` | Model to use and pull |
+| `LLM_BACKEND` | | `nullclaw` | `nullclaw` or `ollama` |
+| `TOOL_GROUNDING_BACKEND` | | `llm` | `llm` or `keyword` |
+| `NULLCLAW_PAIRING_CODE` | | *(empty)* | Leave empty — pairing disabled by default |
+
+Service URLs (nullwatch, nullclaw, ollama) are automatically set to Docker service names inside the compose network. Only override them for local development without Docker.
+
+The Docker stack creates the `nullclaw` home and workspace volumes automatically. You do not need to create a `nullclaw-test-home` directory by hand when using Compose.
+
+## Bot commands
+
+| Command | Description |
+|---|---|
+| `/agent <message>` | Send request to nullclaw agent (memory + tools) |
+| `/rag <question>` | Answer from context + RAG hallucination check |
+| `/tool <request>` | Tool call + schema and grounding validation |
+| `/show_md <FILE.md>` | Show agent workspace markdown file |
+| `/set_md <FILE.md> ...` | Overwrite workspace markdown file |
+| `/set_identity ...` | Update agent IDENTITY.md |
+| `/status` | Health check for all services |
+
+## Local development (without Docker)
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install aiogram python-dotenv
+pip install -e ../nullwatch-py   # install SDK in editable mode
+
+cp .env.example .env
+# edit .env, then run services manually:
+
+# Terminal 1 — nullwatch
+cd ../nullwatch && zig build run -- serve
+
+# Terminal 2 — ollama
+ollama serve
+
+# Terminal 3 — nullclaw
+cd ../nullclaw
+NULLCLAW_HOME=../nullclaw-python-tg-bot/docker/nullclaw-home zig build run -- gateway
+
+# Terminal 4 — bot
+cd ../nullclaw-python-tg-bot
+.venv/bin/python -u -m nullclaw_python_tg_bot
+```
+
+## Project layout
 
 ```text
-local_folder/
-  nullwatch/
-  nullwatch-py/
-  nullclaw/
-  nullclaw-test-home/
-  nullclaw-python-tg-bot/
-```
-
-## Setup
-
-```bash
-cd local_folder/nullclaw-python-tg-bot
-python3 -m venv .venv
-./.venv/bin/pip install aiogram python-dotenv
-cp .env.example .env
-```
-
-Recommended `.env` values:
-
-```bash
-LLM_BACKEND=nullclaw
-OLLAMA_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen3:8b
-NULLWATCH_URL=http://127.0.0.1:7710
-NULLCLAW_URL=http://127.0.0.1:3000
-TOOL_GROUNDING_BACKEND=llm
-TOOL_GROUNDING_LLM_URL=http://127.0.0.1:11434/v1
-TOOL_GROUNDING_MODEL=qwen3:8b
-```
-
-Also set:
-
-- `BOT_TOKEN`
-- `NULLCLAW_PAIRING_CODE` or `NULLCLAW_BEARER_TOKEN`
-
-## Start Processes
-
-1. Start `nullwatch` (In first terminal)
-
-```bash
-cd local_folder/nullwatch
-zig build run -- serve
-```
-
-2. Start Ollama (In second terminal)
-
-```bash
-ollama serve
-```
-
-3. Start `nullclaw gateway` (In third terminal)
-
-```bash
-cd local_folder/nullclaw
-NULLCLAW_HOME=local_folder/nullclaw-test-home zig build run -- gateway
-```
-
-4. Start Telegram bot (In fourth terminal)
-
-```bash
-cd local_folder/nullclaw-python-tg-bot
-./.venv/bin/python -u -m nullclaw_python_tg_bot
-```
-
-## Stop Processes
-
-Stop running processes:
-
-```bash
-pkill -f nullclaw_python_tg_bot || true
-lsof -ti tcp:3000 | xargs kill -9 2>/dev/null || true
-lsof -ti tcp:7710 | xargs kill -9 2>/dev/null || true
-lsof -ti tcp:11434 | xargs kill -9 2>/dev/null || true
-```
-
-Clean `nullclaw` runtime state:
-
-```bash
-rm -f local_folder/nullclaw-test-home/workspace/memory/*.md
-rm -f local_folder/nullclaw-test-home/workspace/.nullclaw/workspace-state.json
-rm -f local_folder/nullclaw-test-home/daemon_state.json
-rm -f local_folder/nullclaw-test-home/llm_token_usage.jsonl
-```
-
-Clean `nullwatch` traces and evals:
-
-```bash
-rm -rf /Users/nikolayivanov/.nullwatch/data/*
+nullclaw-python-tg-bot/
+  Dockerfile                      # bot image (includes nullwatch-py SDK)
+  docker-compose.yml              # full stack orchestration
+  Makefile                        # convenience targets
+  setup.sh                        # first-time setup script
+  .env.example                    # configuration template
+  docker/
+    Dockerfile.nullwatch           # builds nullwatch from source (Zig 0.16.0)
+    nullclaw-home/
+      config.json                  # nullclaw config for Docker (uses service names)
+      workspace/                   # agent memory files (persisted as Docker volume)
+  nullclaw_python_tg_bot/
+    bot.py                         # main bot logic
+    nullclaw_gateway.py            # nullclaw A2A client
+  tests/
 ```

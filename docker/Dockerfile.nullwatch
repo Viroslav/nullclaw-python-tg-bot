@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+# Build context: WB_HACKATON/ (parent of nullclaw-python-tg-bot/)
+# Builds nullwatch from source using Zig 0.16.0
+
+# ── Stage 1: Build ────────────────────────────────────────────
+FROM --platform=$BUILDPLATFORM alpine:3.23 AS builder
+
+ARG ZIG_VERSION=0.16.0
+ARG NULLWATCH_REPO=https://github.com/nullclaw/nullwatch.git
+ARG NULLWATCH_REF=main
+
+RUN apk add --no-cache bash curl musl-dev python3 git xz
+
+WORKDIR /app
+RUN git clone --depth=1 --branch "${NULLWATCH_REF}" "${NULLWATCH_REPO}" .
+
+# Vendored from nullclaw so this stack can build without a sibling nullclaw checkout.
+COPY nullclaw-python-tg-bot/docker/install-zig.sh /tmp/install-zig.sh
+RUN set -eu; \
+    chmod +x /tmp/install-zig.sh; \
+    RUNNER_TEMP=/opt bash /tmp/install-zig.sh "${ZIG_VERSION}"; \
+    zig_bin="$(find /opt/nullclaw-zig -name 'zig' -type f | head -1)"; \
+    ln -sf "${zig_bin}" /usr/local/bin/zig; \
+    zig version
+
+ARG TARGETARCH
+RUN --mount=type=cache,target=/root/.cache/zig \
+    --mount=type=cache,target=/app/.zig-cache \
+    set -eu; \
+    arch="${TARGETARCH:-}"; \
+    if [ -z "${arch}" ]; then \
+      case "$(uname -m)" in \
+        x86_64)  arch="amd64" ;; \
+        aarch64) arch="arm64" ;; \
+      esac; \
+    fi; \
+    case "${arch}" in \
+      amd64) zig_target="x86_64-linux-musl" ;; \
+      arm64) zig_target="aarch64-linux-musl" ;; \
+      *) echo "Unsupported TARGETARCH: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall
+
+# ── Stage 2: Runtime (~5 MB) ──────────────────────────────────
+FROM alpine:3.23 AS release
+
+RUN apk add --no-cache ca-certificates && \
+    adduser -D nullwatch && \
+    mkdir -p /nullwatch-data/data && \
+    chown -R nullwatch:nullwatch /nullwatch-data
+
+COPY --from=builder /app/zig-out/bin/nullwatch /usr/local/bin/nullwatch
+
+USER nullwatch
+WORKDIR /nullwatch-data
+ENV NULLWATCH_HOME=/nullwatch-data
+EXPOSE 7710
+
+ENTRYPOINT ["nullwatch", "serve", "--host", "0.0.0.0", "--port", "7710", "--data-dir", "/nullwatch-data/data"]
