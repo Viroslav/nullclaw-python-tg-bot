@@ -315,7 +315,49 @@ def summarize_nullclaw_spans(spans: list[dict]) -> dict:
     }
 
 
-def find_recent_nullclaw_run(started_at_ms: int) -> tuple[str | None, str | None, list[dict]]:
+def normalize_match_text(value: str) -> str:
+    return " ".join(value.split()).strip().lower()
+
+
+def span_detail_text(span: dict) -> str:
+    detail_parts = []
+
+    error_message = span.get("error_message")
+    if isinstance(error_message, str) and error_message.strip():
+        detail_parts.append(error_message)
+
+    attributes = parse_attributes_json(span.get("attributes_json"))
+    detail = parse_tool_detail(attributes)
+    if detail:
+        detail_parts.append(detail)
+
+    return "\n".join(detail_parts)
+
+
+def score_run_candidate(spans: list[dict], request_hint: str = "") -> tuple[int, int, int, int, int]:
+    normalized_hint = normalize_match_text(request_hint) if request_hint else ""
+    latest_ms = max(as_int(span.get("stored_at_ms")) for span in spans)
+    completed = any(span.get("operation") == "turn.complete" for span in spans)
+    tool_calls = sum(1 for span in spans if span.get("operation") == "tool.call")
+    span_count = len(spans)
+
+    request_match = 0
+    if normalized_hint:
+        for span in spans:
+            if span.get("operation") != "llm.request":
+                continue
+            detail = normalize_match_text(span_detail_text(span))
+            if normalized_hint and normalized_hint in detail:
+                request_match = 1
+                break
+
+    return (request_match, int(completed), tool_calls, latest_ms, span_count)
+
+
+def find_recent_nullclaw_run(
+    started_at_ms: int,
+    request_hint: str = "",
+) -> tuple[str | None, str | None, list[dict]]:
     for _ in range(NULLCLAW_SPAN_POLL_ATTEMPTS):
         spans = client.list_spans(limit=NULLCLAW_SPAN_LIMIT)
         candidates = []
@@ -340,7 +382,7 @@ def find_recent_nullclaw_run(started_at_ms: int) -> tuple[str | None, str | None
 
             best_key = max(
                 grouped,
-                key=lambda key: max(as_int(span.get("stored_at_ms")) for span in grouped[key]),
+                key=lambda key: score_run_candidate(grouped[key], request_hint=request_hint),
             )
             best_spans = sorted(grouped[best_key], key=lambda span: as_int(span.get("stored_at_ms")))
             return best_key[1], best_key[0], best_spans
@@ -348,8 +390,11 @@ def find_recent_nullclaw_run(started_at_ms: int) -> tuple[str | None, str | None
     return None, None, []
 
 
-def extract_nullclaw_tool_calls(started_at_ms: int) -> tuple[list[dict], dict]:
-    observed_run_id, observed_source, spans = find_recent_nullclaw_run(started_at_ms)
+def extract_nullclaw_tool_calls(started_at_ms: int, request_hint: str = "") -> tuple[list[dict], dict]:
+    observed_run_id, observed_source, spans = find_recent_nullclaw_run(
+        started_at_ms,
+        request_hint=request_hint,
+    )
     tool_calls: list[dict] = []
     span_summary = summarize_nullclaw_spans(spans)
 
@@ -408,7 +453,7 @@ def invoke_model(run_id: str, messages: list[dict], tools: list[dict] | None = N
         prompt,
         context_id=run_id,
     )
-    tool_calls, observed = extract_nullclaw_tool_calls(started_at_ms)
+    tool_calls, observed = extract_nullclaw_tool_calls(started_at_ms, request_hint=prompt)
     return {
         "message": {
             "content": strip_thinking(str(response.get("response") or "")),

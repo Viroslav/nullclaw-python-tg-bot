@@ -115,5 +115,88 @@ class NullclawToolEvalTests(unittest.TestCase):
         self.assertIn("AllProvidersFailed", eval_.notes)
 
 
+class RunCorrelationTests(unittest.TestCase):
+    def test_request_hint_wins_over_newer_unrelated_run(self):
+        matching_run = [
+            {
+                "run_id": "run-match",
+                "source": "nullclaw-hackathon-test",
+                "operation": "llm.request",
+                "stored_at_ms": 110,
+                "attributes_json": '[{"key":"detail","value":{"stringValue":"#2 role=user content=\\"please read TOOLS.md\\""}}]',
+            },
+            {
+                "run_id": "run-match",
+                "source": "nullclaw-hackathon-test",
+                "operation": "turn.complete",
+                "stored_at_ms": 130,
+                "attributes_json": "[]",
+            },
+        ]
+        newer_unrelated_run = [
+            {
+                "run_id": "run-newer",
+                "source": "nullclaw-hackathon-test",
+                "operation": "llm.request",
+                "stored_at_ms": 120,
+                "attributes_json": '[{"key":"detail","value":{"stringValue":"#2 role=user content=\\"unrelated request\\""}}]',
+            },
+            {
+                "run_id": "run-newer",
+                "source": "nullclaw-hackathon-test",
+                "operation": "turn.complete",
+                "stored_at_ms": 140,
+                "attributes_json": "[]",
+            },
+        ]
+
+        with patch.object(
+            bot.client,
+            "list_spans",
+            return_value=[*matching_run, *newer_unrelated_run],
+        ):
+            run_id, source, spans = bot.find_recent_nullclaw_run(100, request_hint="please read TOOLS.md")
+
+        self.assertEqual(run_id, "run-match")
+        self.assertEqual(source, "nullclaw-hackathon-test")
+        self.assertEqual([span["run_id"] for span in spans], ["run-match", "run-match"])
+
+    def test_extract_nullclaw_tool_calls_uses_matching_run(self):
+        spans = [
+            {
+                "run_id": "run-match",
+                "source": "nullclaw-hackathon-test",
+                "operation": "llm.request",
+                "stored_at_ms": 110,
+                "attributes_json": '[{"key":"detail","value":{"stringValue":"#2 role=user content=\\"please read TOOLS.md\\""}}]',
+            },
+            {
+                "run_id": "run-match",
+                "source": "nullclaw-hackathon-test",
+                "operation": "tool.call",
+                "stored_at_ms": 120,
+                "tool_name": "file_read",
+                "status": "ok",
+                "attributes_json": '[{"key":"args","value":{"stringValue":"\\"{\\\\\\"path\\\\\\":\\\\\\"TOOLS.md\\\\\\"}\\""}},{"key":"detail","value":{"stringValue":"ok"}}]',
+            },
+            {
+                "run_id": "run-other",
+                "source": "nullclaw-hackathon-test",
+                "operation": "tool.call",
+                "stored_at_ms": 130,
+                "tool_name": "file_read",
+                "status": "ok",
+                "attributes_json": '[{"key":"args","value":{"stringValue":"\\"{\\\\\\"path\\\\\\":\\\\\\"OTHER.md\\\\\\"}\\""}}]',
+            },
+        ]
+
+        with patch.object(bot.client, "list_spans", return_value=spans):
+            tool_calls, observed = bot.extract_nullclaw_tool_calls(100, request_hint="please read TOOLS.md")
+
+        self.assertEqual(observed["observed_run_id"], "run-match")
+        self.assertEqual(tool_calls[0]["name"], "file_read")
+        self.assertEqual(tool_calls[0]["arguments"], {"path": "TOOLS.md"})
+
+
 if __name__ == "__main__":
     unittest.main()
