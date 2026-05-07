@@ -1,3 +1,7 @@
 __all__ = ["main"]
 
-from .bot import main
+
+def main() -> int:
+    from .bot import main as _main
+
+    return _main()
