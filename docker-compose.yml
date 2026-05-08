@@ -30,8 +30,7 @@ services:
       default:
         ipv4_address: 172.28.0.10
     volumes:
-      # Test setup: reuse the host Ollama cache to avoid re-downloading models.
-      - /Users/nikolayivanov/.ollama:/root/.ollama
+      - ollama-data:/root/.ollama
     restart: unless-stopped
     # GPU support — uncomment for NVIDIA:
     # deploy:
